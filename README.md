@@ -1,34 +1,70 @@
 # Mechanism-Aware Multi-Agent LLM Resource Allocation
 
-Small, reproducible simulation of agents competing for a fixed token budget. It uses deterministic task workloads and does not call an LLM API; token use and cost are therefore explicit and repeatable.
+N agents share one fixed token budget. An explicit mechanism splits it: **proportional fairness** (primary), **priority auction** or **VCG** (baselines). We compare **mechanism-aware** agents with **naive** agents, which request greedily. We also compare two allocator designs:
 
-## Shared interface
+- **Split:** the allocator may hand out partial grants.
+- **Whole:** partial grants are pooled and spent only on complete requests, in priority order.
 
-Each allocator accepts `{agent_id: bid/request}` and an integer budget, and returns `{agent_id: allocated_tokens}`. Inputs are token requests plus per-token bids, represented by `Bid(request, value_per_token)`. Allocation is capped by each request and by the budget. The VCG mechanism additionally exposes payments in its result metadata; its tokens allocated are still bounded by the shared budget.
+The simulation uses synthetic, seeded workloads and makes no LLM API calls. Agents only know an *estimate* of each task's cost; the real cost (±40%) is revealed when the task runs, as with real LLM output.
 
-Tasks have a token requirement, a value, and a success value. Agents process tasks in queue order when their allocation covers the requirement. Task value is earned only on completion; partial funding consumes allocated tokens but does not complete a task. Cost is allocated tokens times the configured cost per token, capped by the common token budget. This makes success rate (completed tasks / offered tasks), welfare (sum of completed task values), cost, and welfare per budget measurable.
+Pure Python 3.10+, standard library only.
 
-## Implemented pieces
+## Quick start
 
-- `allocation.py`: proportional-fair allocation (weighted log utility with request caps), bid-priority allocation, and welfare-maximizing VCG allocation over discrete token units; Jain fairness and welfare helpers.
-- `agents.py`: task queues, greedy naive bids, and mechanism-aware bids.
-- `simulation.py`: one round of requests, allocation, task completion, and hard budget accounting.
-- `experiments.py`: matrix across three mechanisms, two agent strategies, varied budgets and agent counts; CSV output and charts when matplotlib is installed.
-- `tests/`: toy-input unit tests for the mechanisms and fairness calculations.
-
-## Run
-
-From this directory:
-
-```powershell
-python -m unittest discover -s tests
-python experiments.py --output results
+```bash
+python tui.py                            # menu-driven explorer: walkthrough, comparisons, drill-down, sweeps, settings
+python -m unittest discover -s tests     # 11 tests: mechanisms, whole-request mode, budget safety, declines/refunds/retries
+python demo.py                           # live walkthrough of three designs (~1 s)
+python experiments.py                    # full matrix: 9,720 runs (~6 s) -> results/
 ```
 
-The experiment runner writes `results.csv` and an SVG comparison chart (or `comparison.png` when matplotlib is installed). It uses synthetic fixed task values and does not need network access or API credentials.
+Demo options: `--agents 10 --budget-ratio 0.5 --noise 0.4 --mechanism vcg --seed 3 --seeds 30`. Use `--noise 0` for exact costs.
 
-## Modeling notes and scope
+## How we test without an LLM
 
-All three policies receive the same requests. Proportional fairness maximizes `sum(bid_i * log(1 + allocation_i))` subject to request caps and the budget, using discrete token allocation. Priority auction assigns units in descending bid order. VCG assigns discrete units by declared marginal values and charges each winner the externality imposed on others; values are fixed per token in this model. The simulation reports token spend separately from VCG transfers, since a transfer is not an LLM token cost. Mechanism-aware agents submit requests based on queued task demand and calibrate bids to their task value and the mechanism; naive agents request all remaining work and bid aggressively. These are controlled toy strategies, not claims about strategic truthfulness of LLMs.
+An LLM call does two things that matter to an allocator: it **uses tokens** and it **delivers something of value**. Each simulated task is exactly that pair.
 
-The report outline and interpretation guide are in `REPORT.md`. Literature references supplied with the project brief are recorded there as leads and should be verified before formal submission.
+| Real LLM agent | Simulation |
+|---|---|
+| Input tokens are known; output length is not | Agent sees an `estimate`; the real cost is estimate × uniform(0.6, 1.4), revealed at run time |
+| `max_tokens` cap reached → response cut off | Grant smaller than the real cost → tokens used are lost, nothing is delivered |
+| Billed per token actually used | A finished task hands its unused grant back to the pool |
+| Retry with a higher cap after a cut-off | Aware agents retry with a request 1.5× larger |
+| Task outcome worth something to the business | Each task has a value; "welfare" = total value of finished tasks |
+
+Every strategy sees the same tasks for a given seed, and results are averaged over 30 seeds.
+
+## Headline result (5 agents, 30 workloads, budget = 25% of demand, costs ±40%)
+
+![whole allocator](results/comparison_whole.svg)
+
+| Design | Value / budget token | Tasks done | Fairness (Jain) | Wasted | Left unused |
+|---|---|---|---|---|---|
+| Proportional fair, split, naive agents | 0.78 | 14% | **0.98** | 65% | 0% |
+| Proportional fair, split, aware agents (they decline partial grants) | 0.49 | 10% | 0.54 | 1% | 75% |
+| **Proportional fair, whole, aware agents** | **1.81** | **26%** | 0.55 | **4%** | 10% |
+| VCG, split, naive agents | 1.61 | 22% | 0.32 | 21% | 0% |
+| VCG, whole, aware agents | 1.83 | 25% | 0.57 | 4% | 9% |
+
+1. **Fair splitting wastes most of a tight budget.** With naive agents, proportional fairness gives everyone a slice too small to finish anything, and 65% of tokens are burned on calls that get cut off.
+2. **Declining partial grants alone backfires.** Aware agents stop wasting tokens. But proportional fairness keeps re-splitting the same thin slices, so everyone declines and 75% of the budget is never used.
+3. **Pooling into whole requests fixes it.** The allocator collects the partial grants and fully funds the highest-priority requests that fit. Aware agents reserve for the 95th percentile of their cost, keep only what they use and return the rest. Result: 2.3× the value of the fair split, with waste at 4%. This holds at 3, 5 and 10 agents, and with exact costs (1.85).
+4. **The trade-off is fairness.** Whole grants are lumpy, so Jain's index drops from 0.98 to 0.55 at a 25% budget. The gap closes as the budget grows (0.84 at 50%, 0.89 at 75%).
+5. **Naive agents are punished by the whole-request allocator.** A whole backlog rarely fits, so naive agents get 1.36 value per token against 1.81 for aware agents. The rule itself rewards asking for what you actually need.
+6. **The mechanism matters less once requests are whole.** Proportional fairness, the priority auction and VCG all land at 1.81–1.83. VCG payments still drop with aware agents (3,931 → 1,179) because they stop inflating bids.
+
+Full tables: `results/summary.md`. Every run: `results/results.csv`. Per-configuration means: `results/summary.csv`. The split-allocator chart is `results/comparison_split.svg`.
+
+## How it works
+
+| File | What it does |
+|---|---|
+| `allocation.py` | Three mechanisms behind one interface: `{agent: Bid(request, value_per_token)}, budget, whole -> AllocationResult(allocations, payments)`. Proportional fairness maximizes `Σ bid·log(1+x)` exactly. The priority auction is first-price. VCG charges each agent its externality. With `whole=True`, every mechanism funds complete requests only; proportional fairness pools its partial grants and re-spends the pool by bid priority. |
+| `agents.py` | Seeded tasks, each with an estimate, a hidden real cost and a value. **Naive** agents request their whole estimated backlog, bid 2× their best value rate, and run whatever they get. **Aware** agents request their next task × a safety margin (95th percentile of cost error), decline smaller grants, return unused tokens, and retry 1.5× larger after a cut-off. **Mixed**: one naive agent among aware ones. |
+| `simulation.py` | Multi-round episode against one hard budget. Agents re-bid each round on what is left; it stops when the budget runs out, the work runs out, or nothing can be funded. An assert guarantees the budget is never overspent. |
+| `experiments.py` | Matrix: 2 cost-noise levels × 2 allocators × 3 mechanisms × 3 strategies × {3, 5, 10} agents × {25, 50, 75}% budget × 30 seeds. Writes CSVs, markdown tables and SVG charts. |
+| `demo.py` | Round-by-round trace of the three designs on one workload, then every design averaged over 30 workloads. |
+
+Metrics: task success rate, token spend and cost ($3 per 1M tokens), wasted tokens (cut-off calls), unused budget, Jain's index over tokens used, welfare, welfare per budget token, and transfers (auction payments, reported separately from token cost).
+
+See `REPORT.md` for the research framing, the literature and the limitations.

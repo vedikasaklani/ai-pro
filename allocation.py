@@ -1,5 +1,6 @@
 """Discrete token allocation mechanisms and common evaluation metrics."""
 from dataclasses import dataclass
+import heapq
 import math
 from typing import Mapping
 
@@ -25,61 +26,66 @@ def _validate(bids: Mapping[str, Bid], budget: int) -> None:
         raise ValueError("budget must be non-negative")
 
 
-def proportional_fair(bids: Mapping[str, Bid], budget: int) -> AllocationResult:
-    """Greedy discrete maximizer for weighted log utility with request caps."""
+def _greedy(bids: Mapping[str, Bid], budget: int, exclude: str | None = None, whole: bool = False) -> dict[str, int]:
+    """Fill requests in descending bid order; optimal for linear per-token values.
+
+    whole=True never grants part of a request: a request that does not fit is skipped
+    and the tokens go to the next-priority request that does.
+    """
+    out = {k: 0 for k in bids if k != exclude}
+    left = budget
+    for k in sorted(out, key=lambda k: (-bids[k].value_per_token, k)):
+        if whole and bids[k].request > left:
+            continue
+        out[k] = min(left, bids[k].request)
+        left -= out[k]
+    return out
+
+
+def proportional_fair(bids: Mapping[str, Bid], budget: int, whole: bool = False) -> AllocationResult:
+    """Exact discrete maximizer of sum(bid_i * log(1 + x_i)) with request caps, no payments.
+
+    whole=True pools every partial grant and re-spends the pool on whole requests by bid priority.
+    """
     _validate(bids, budget)
     out = {k: 0 for k in bids}
-    for _ in range(min(budget, sum(b.request for b in bids.values()))):
-        eligible = [k for k, b in bids.items() if out[k] < b.request and b.value_per_token > 0]
-        if not eligible:
-            break
-        # Discrete marginal gain in bid_i * log(1 + x_i).
-        chosen = max(eligible, key=lambda k: (bids[k].value_per_token * math.log((2 + out[k]) / (1 + out[k])), k))
-        out[chosen] += 1
+    # Marginal gains are decreasing per agent, so unit-by-unit greedy is optimal.
+    heap = [(-b.value_per_token * math.log(2), k) for k, b in bids.items() if b.request and b.value_per_token > 0]
+    heapq.heapify(heap)
+    left = budget
+    while left and heap:
+        _, k = heapq.heappop(heap)
+        out[k] += 1
+        left -= 1
+        if out[k] < bids[k].request:
+            heapq.heappush(heap, (-bids[k].value_per_token * math.log((2 + out[k]) / (1 + out[k])), k))
+    if whole:
+        short = {k: b for k, b in bids.items() if out[k] < b.request}
+        pool = left + sum(out[k] for k in short)
+        out.update(_greedy(short, pool, whole=True))
     return AllocationResult(out, {k: 0.0 for k in bids})
 
 
-def priority_auction(bids: Mapping[str, Bid], budget: int) -> AllocationResult:
-    """Allocate each token to the highest declared per-token bid."""
+def priority_auction(bids: Mapping[str, Bid], budget: int, whole: bool = False) -> AllocationResult:
+    """First-price priority auction: highest bid served first, winners pay their own bid."""
     _validate(bids, budget)
-    out = {k: 0 for k in bids}
-    order = sorted(bids, key=lambda k: (-bids[k].value_per_token, k))
-    left = budget
-    for k in order:
-        amount = min(left, bids[k].request)
-        out[k] = amount
-        left -= amount
-        if left == 0:
-            break
-    return AllocationResult(out, {k: 0.0 for k in bids})
+    out = _greedy(bids, budget, whole=whole)
+    return AllocationResult(out, {k: out[k] * bids[k].value_per_token for k in bids})
 
 
-def vcg(bids: Mapping[str, Bid], budget: int) -> AllocationResult:
-    """Efficient discrete allocation; VCG externality payments, per token."""
+def vcg(bids: Mapping[str, Bid], budget: int, whole: bool = False) -> AllocationResult:
+    """Efficient allocation; each agent pays the declared value it displaces from others.
+
+    With whole=True the greedy fill is a knapsack heuristic, so truthfulness is no longer guaranteed.
+    """
     _validate(bids, budget)
-    out = {k: 0 for k in bids}
-    order = sorted(bids, key=lambda k: (-bids[k].value_per_token, k))
-    left = budget
-    for k in order:
-        amount = min(left, bids[k].request)
-        out[k] = amount
-        left -= amount
-        if not left:
-            break
-    total = sum(out[k] * bids[k].value_per_token for k in bids)
+    out = _greedy(bids, budget, whole=whole)
     payments = {}
-    for excluded in bids:
-        others = [k for k in bids if k != excluded]
-        counterfactual = {k: 0 for k in others}
-        for _ in range(min(budget, sum(bids[k].request for k in others))):
-            eligible = [k for k in others if counterfactual[k] < bids[k].request]
-            if not eligible:
-                break
-            chosen = max(eligible, key=lambda k: (bids[k].value_per_token, k))
-            counterfactual[chosen] += 1
-        others_without = sum(counterfactual[k] * bids[k].value_per_token for k in others)
-        others_with = sum(out[k] * bids[k].value_per_token for k in others)
-        payments[excluded] = max(0.0, others_without - others_with)
+    for i in bids:
+        without_i = _greedy(bids, budget, exclude=i, whole=whole)
+        others_without = sum(x * bids[k].value_per_token for k, x in without_i.items())
+        others_with = sum(out[k] * bids[k].value_per_token for k in bids if k != i)
+        payments[i] = max(0.0, others_without - others_with)
     return AllocationResult(out, payments)
 
 
